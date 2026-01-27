@@ -1,0 +1,476 @@
+---
+title: Bayesian Ranking of Traffic Fatality Rates per Distance Travelled Across Irish Counties
+author:
+  - name: Sara Raees
+  - name: Yashaswini Malleshwarppa
+    affil: 1
+affiliation:
+  - num: 1
+    address: School of Mathematical and Statistical Sciences, University of Galway
+logoleft_name: https&#58;//sport.universityofgalway.ie/assets/img/logo2.png
+
+poster_height: "594mm"
+poster_width: "841mm"
+column_numbers: 4
+column_margins: "0.5in"
+primary_colour: "#a80050"
+secondary_colour: "#84003d"
+accent_colour: "#e6007e"
+author_textcol: "white"
+title_textsize: "90pt"
+author_textsize: "60pt"
+body_textsize: "25pt"
+output:
+  posterdown::posterdown_html:
+    self_contained: true
+    pandoc_args: --mathjax
+    number_sections: false
+knit: pagedown::chrome_print
+---
+
+
+
+```{css, echo=FALSE}
+div.logo_left{
+  width: 20%;
+}
+div.poster_title{
+  width: 80%;
+}
+.section h4 {
+    break-after: column;
+}
+div.footnotes {
+    font-size: 18pt;
+}
+```
+
+
+
+<!-- Poster content below (dimensions unchanged). -->
+
+
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  tidy = FALSE,
+  message = FALSE,
+  fig.align = 'center',
+  out.width = "100%"
+)
+options(knitr.table.format = "html")
+
+library(tidyverse)
+library(plotly)
+library(kableExtra)
+library(lme4)
+library(performance)
+library(rjags)
+library(coda)
+library(viridis)
+library(sf)
+library(geodata)
+library(rnaturalearth)
+library(scales)
+library(ggplot2)
+library(dplyr)
+library(Polychrome)
+```
+
+```{r}
+pick_stat_col <- function(df) {
+  candidates <- c("Statistic.Label", "Statistic.Label.", "Statistic", "Statistic.")
+  hit <- candidates[candidates %in% names(df)]
+  if (length(hit) == 0) return(NA_character_)
+  hit[1]
+}
+```
+
+
+# Background and Problem
+
+
+
+Road fatality **counts** differ across counties partly because counties have different **exposure** (distance travelled).
+
+We estimate **fatality rates per distance travelled** and rank counties using hierarchical models to reduce noise in small-count counties.
+
+
+
+# Objectives
+
+
+
+- Estimate and compare county fatality rates per distance travelled (2015–2024).
+
+- Assess time trends using a Poisson GLMM (random intercept vs random slope by county).
+
+- Rank counties using a Bayesian hierarchical Poisson model (county-specific rates).
+
+
+
+# Data Sources
+
+
+
+- `road_accidents.csv`: Persons killed and injured by county-year.
+
+- `THA17...csv`: Vehicle kilometres travelled by county-year (exposure).
+
+
+
+# Results 1: Deaths by county over time
+
+
+
+```{r read_data, include=FALSE, results='hide'}
+df1 <- read.csv("road_accidents.csv")
+df2 <- read.csv("THA17.20251105T151118.csv")
+
+cat("Head of road_accidents.csv:\n")
+head(df1)
+
+cat("\nHead of THA17.20251105T151118.csv:\n")
+head(df2)
+```
+
+
+```{r prep_data, include=FALSE, results='hide'}
+library(dplyr)
+library(tidyr)
+
+df1_small <- df1 %>%
+  filter(Statistic.Label %in% c("Persons Killed", "Persons Injured"),
+         Year >= 2015) %>%
+  mutate(County = gsub("Co\\. ", "", County)) %>%
+  select(Year, County, Statistic.Label, VALUE)
+
+accidents <- df1_small %>%
+  pivot_wider(names_from = Statistic.Label, values_from = VALUE)
+
+df2_small <- df2 %>%
+  mutate(County = gsub("Co\\. ", "", County.of.Ownership)) %>%
+  filter(Year >= 2015) %>%
+  select(Year, County, Type.of.Vehicle, Year.of.Registration, Km_Travelled = VALUE)
+
+final_df <- merge(df2_small, accidents,
+                  by = c("Year", "County"),
+                  all.x = TRUE)
+
+# View
+head(final_df)
+```
+
+
+```{r deaths_plot, out.width='90%', fig.height=4.2}
+
+# Build distinct colour palette for all counties
+cols <- setNames(
+  Polychrome::palette36.colors(length(unique(accidents$County))),
+  sort(unique(accidents$County))
+)
+
+ggplot(accidents,
+       aes(x = Year, y = `Persons Killed`,
+           color = County, group = County)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = sort(unique(accidents$Year))) +
+  scale_color_manual(values = cols) +
+  labs(
+    title = "Number of People Killed by County (Year by Year)",
+    x = "Year",
+    y = "Persons Killed",
+    color = "County"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+```
+
+```{r injuries_plot, out.width='90%', fig.height=4.2}
+# build a distinct colour set (up to 36)
+cols <- setNames(Polychrome::palette36.colors(length(unique(accidents$County))),
+                 sort(unique(accidents$County)))
+
+ggplot(accidents,
+       aes(x = Year, y = `Persons Injured`,
+           color = County, group = County)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = sort(unique(accidents$Year))) +
+  scale_color_manual(values = cols) +
+  labs(
+    title = "Number of People Injured by County (Year by Year)",
+    x = "Year",
+    y = "Persons Injured",
+    color = "County"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+```
+
+
+
+# Results 2: Overall rate trend
+
+```{r overall_build, include=FALSE, results='hide'}
+# Assumes df1 and df2 already exist from your read_data chunk
+
+stat_col2 <- pick_stat_col(df2)
+stopifnot(!is.na(stat_col2))
+
+# National exposure (sum of county vehicle km) in million km
+vmt_nat <- df2 %>%
+  mutate(County = gsub("Co\\. ", "", County.of.Ownership)) %>%
+  filter(.data[[stat_col2]] == "Kilometres Travelled",
+         Year >= 2015, Year <= 2024,
+         County.of.Ownership != "Ireland",
+         Type.of.Vehicle == "All vehicle types",
+         Year.of.Registration == "All years") %>%
+  transmute(Year, VM = VALUE / 1000)  # million km
+
+# National deaths and injuries per year (sum across counties)
+deaths_nat <- df1 %>%
+  filter(Statistic.Label == "Persons Killed",
+         Year >= 2015, Year <= 2024) %>%
+  group_by(Year) %>%
+  summarise(deaths = sum(VALUE, na.rm = TRUE), .groups = "drop")
+
+inj_nat <- df1 %>%
+  filter(Statistic.Label == "Persons Injured",
+         Year >= 2015, Year <= 2024) %>%
+  group_by(Year) %>%
+  summarise(injuries = sum(VALUE, na.rm = TRUE), .groups = "drop")
+
+overall <- vmt_nat %>%
+  group_by(Year) %>%
+  summarise(VM = sum(VM, na.rm = TRUE), .groups = "drop") %>%
+  left_join(deaths_nat, by = "Year") %>%
+  left_join(inj_nat, by = "Year") %>%
+  mutate(
+    deaths_rate   = deaths / VM,     # deaths per million km (since VM is in million km)
+    injuries_rate = injuries / VM    # injuries per million km
+  ) %>%
+  arrange(Year)
+```
+
+
+```{r overall_deaths_plot, echo=FALSE, out.width="95%", fig.height=3.4}
+library(ggplot2)
+library(scales)
+
+ggplot(overall, aes(x = Year, y = deaths_rate)) +
+  geom_line(linewidth = 1.3, color = "#d73027") +
+  geom_point(size = 3, color = "#d73027") +
+  scale_x_continuous(breaks = sort(unique(overall$Year))) +
+  scale_y_continuous(labels = number_format(accuracy = 0.01)) +
+  theme_minimal(base_size = 16) +
+  labs(
+    title = "Overall Road Fatality Rate in Ireland",
+    subtitle = "Deaths per million vehicle kilometres travelled",
+    x = "Year",
+    y = "Deaths per million km"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r overall_injuries_plot, echo=FALSE, out.width="95%", fig.height=3.4}
+ggplot(overall, aes(x = Year, y = injuries_rate)) +
+  geom_line(linewidth = 1.3, color = "#4575b4") +
+  geom_point(size = 3, color = "#4575b4") +
+  scale_x_continuous(breaks = sort(unique(overall$Year))) +
+  scale_y_continuous(labels = number_format(accuracy = 1)) +
+  theme_minimal(base_size = 16) +
+  labs(
+    title = "Overall Road Injury Rate in Ireland",
+    subtitle = "Injuries per million vehicle kilometres travelled",
+    x = "Year",
+    y = "Injuries per million km"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+
+# Results 3: Bayesian county rate ranking
+
+
+
+```{r bayes_fit, include=FALSE, results='hide'}
+accidents <- df1 %>%
+  filter(Statistic.Label == "Persons Killed", Year >= 2015, Year <= 2024) %>%
+  mutate(County = gsub("Co\\. ", "", County)) %>%
+  transmute(Year, County, deaths = VALUE)
+
+vmt <- df2 %>%
+  mutate(County = gsub("Co\\. ", "", County.of.Ownership)) %>%
+  filter(Statistic.Label == "Kilometres Travelled",
+         Year >= 2015, Year <= 2024,
+         County.of.Ownership != "Ireland",
+         Type.of.Vehicle == "All vehicle types",
+         Year.of.Registration == "All years") %>%
+  transmute(Year, County, VM = VALUE / 1000)   
+
+dat <- left_join(vmt, accidents, by = c("Year", "County")) %>%
+  mutate(deaths = ifelse(is.na(deaths), 0L, deaths)) %>%
+  arrange(County, Year)
+
+dat <- dat %>% mutate(county_id = as.integer(factor(County)))
+N_county <- n_distinct(dat$county_id)
+
+X <- dat$deaths
+VM <- dat$VM
+county <- dat$county_id
+nObs <- nrow(dat)
+
+fatalities_model <- "
+model{
+  for (i in 1:nObs) {
+    X[i] ~ dpois(theta[county[i]] * VM[i])
+  }
+  for (c in 1:N) {
+    theta[c] ~ dgamma(alpha, beta)
+  }
+  alpha ~ dgamma(0.001, 0.001)
+  beta  ~ dgamma(0.001, 0.001)
+}
+"
+
+jags_data <- list(X = X, VM = VM, county = county, nObs = nObs, N = N_county)
+
+fatalities_jags <- jags.model(
+  textConnection(fatalities_model),
+  data = jags_data,
+  n.chains = 4,
+  n.adapt = 1000
+)
+
+update(fatalities_jags, n.iter = 10000)  # burn-in
+
+fatalities_sim <- coda.samples(
+  model = fatalities_jags,
+  variable.names = c("theta", "alpha", "beta"),
+  n.iter = 20000
+)
+
+print(summary(fatalities_sim))
+```
+
+
+```{r theta_rank, echo=FALSE, out.width='90%', fig.height=3.9}
+theta_mat <- as.matrix(fatalities_sim)
+theta_cols <- grep("theta[", colnames(theta_mat), fixed = TRUE)
+theta_only <- theta_mat[, theta_cols, drop = FALSE]
+
+# Map county_id -> County name
+county_map <- dat %>%
+  distinct(county_id, County) %>%
+  arrange(county_id)
+
+theta_post <- tibble(
+  county_id  = 1:ncol(theta_only),
+  theta_mean = colMeans(theta_only),
+  theta_l95  = apply(theta_only, 2, quantile, 0.025),
+  theta_u95  = apply(theta_only, 2, quantile, 0.975)
+) %>%
+  left_join(county_map, by = "county_id") %>%
+  arrange(desc(theta_mean))
+
+# Small top-table (fits poster)
+knitr::kable(
+  theta_post %>% slice(1:8),
+  caption = "Top 8 counties by posterior mean fatality rate (theta) with 95% credible intervals.",
+  digits = 4
+) |>
+  kable_styling(font_size = 18)
+
+# Plot top counties with uncertainty (colored by county)
+top15 <- theta_post %>% slice(1:15)
+
+ggplot(top15, aes(x = reorder(County, theta_mean),
+                  y = theta_mean,
+                  color = County)) +
+  geom_point(size = 2.2) +
+  geom_errorbar(aes(ymin = theta_l95, ymax = theta_u95), width = 0.2) +
+  coord_flip() +
+  scale_color_viridis_d(option = "C") +
+  labs(
+    title = "Bayesian county ranking of fatality rate (top 15)",
+    subtitle = "Color scheme: each color corresponds to a county (identifier only)",
+    x = "County",
+    y = "Posterior mean theta (95% CrI)",
+    color = "County (color = ID)"
+  ) +
+  annotate(
+    "text",
+    x = Inf, y = -Inf,
+    label = "Colours distinguish counties only; risk is shown by theta (x-axis) and 95% CrI bars.",
+    hjust = 1.05, vjust = -0.6, size = 3.2
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 9),
+    legend.text  = element_text(size = 8),
+    plot.subtitle = element_text(size = 10)
+  )
+```
+
+
+
+
+# Interactive Dashboard Results (Shiny App)
+
+**We built an interactive Ireland Road Safety Dashboard (2015–2024)** to explore county-level variation in deaths, injuries, and exposure-adjusted rates.
+
+**App outputs (user controls):**
+- Map variable options: deaths, injuries, deaths per billion km, injuries per billion km, log(total km), and average population (2015–2024).
+- Year slider (2015–2024) and county dropdown to zoom/focus.
+- Click counties to view a popup with the selected metric for the chosen year.
+- Big-city counties (Dublin, Cork, Galway, Limerick, Waterford) are highlighted with an outline.
+
+```{r app_screenshot, echo=FALSE, out.width='90%'}
+if (file.exists("app_screenshot.png")) {
+  knitr::include_graphics("app_screenshot.png")
+}
+```
+
+*Interpretation:* County colours on the map indicate the **level of the selected metric** (legend shown on the map). Darker colours correspond to higher values for that metric (viridis scale).
+
+
+
+# Next Steps
+
+
+
+- Extend the Bayesian model to include county-specific trends (random slopes) and sensitivity to alternative priors.
+
+- Produce maps of posterior mean rates for selected years and overall 2015–2024.
+
+
+
+# GitHub
+
+
+
+Project repository: <https://github.com/>
+
+
+
+# References
+
+
+
+- Evans (2010). doi: 10.6030/1939-067x-3.1.1
+
+- Murphy et al. (2005). doi: 10.1186/1468-6708-6-11

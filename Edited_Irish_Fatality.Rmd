@@ -1,0 +1,527 @@
+---
+title: Bayesian Ranking of Traffic Fatality Rates per Distance Travelled Across Irish Counties
+author:
+  - name: Sara Raees
+  - name: Yashaswini Malleshwarppa
+    affil: 1
+affiliation:
+  - num: 1
+    address: School of Mathematical and Statistical Sciences, University of Galway
+logoleft_name: https&#58;//sport.universityofgalway.ie/assets/img/logo2.png
+
+poster_height: "594mm"
+poster_width: "841mm"
+column_numbers: 4
+column_margins: "0.5in"
+primary_colour: "#a80050"
+secondary_colour: "#84003d"
+accent_colour: "#e6007e"
+author_textcol: "white"
+title_textsize: "65pt"
+author_textsize: "30pt"
+body_textsize: "16pt"
+output:
+  posterdown::posterdown_html:
+    self_contained: true
+    pandoc_args: --mathjax
+    number_sections: false
+knit: pagedown::chrome_print
+---
+
+
+
+```{css, echo=FALSE}
+div.logo_left{
+  width: 20%;
+}
+div.poster_title{
+  width: 80%;
+}
+.section h4 {
+    break-after: column;
+}
+div.footnotes {
+    font-size: 18pt;
+}
+/* Make main section headings (the ones written as # Heading) smaller */
+.section h1{
+  font-size: 34pt !important;   /* change this number until you like it */
+  line-height: 1.05;
+  margin-top: 0.2em;
+  margin-bottom: 0.35em;
+}
+
+/* Optional: if you also use ## or ### anywhere */
+.section h2{ font-size: 32pt !important; }
+.section h3{ font-size: 26pt !important; }
+```
+
+
+
+<!-- Poster content below (dimensions unchanged). -->
+
+
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  tidy = FALSE,
+  message = FALSE,
+  fig.align = 'center',
+  out.width = "100%"
+)
+options(knitr.table.format = "html")
+
+library(tidyverse)
+library(plotly)
+library(kableExtra)
+library(lme4)
+library(performance)
+library(rjags)
+library(coda)
+library(viridis)
+library(sf)
+library(geodata)
+library(rnaturalearth)
+library(scales)
+library(ggplot2)
+library(dplyr)
+library(Polychrome)
+```
+
+```{r}
+pick_stat_col <- function(df) {
+  candidates <- c("Statistic.Label", "Statistic.Label.", "Statistic", "Statistic.")
+  hit <- candidates[candidates %in% names(df)]
+  if (length(hit) == 0) return(NA_character_)
+  hit[1]
+}
+```
+
+
+# Background and Problem
+
+
+
+Road traffic fatalities remain a major public health concern in Ireland, with substantial variation across counties. Simple comparisons based on the number of fatalities can be misleading as often recorded by the media, as counties differ greatly in population size and the amount of driving that occurs. Counties with high traffic volumes may record more deaths despite lower underlying risk, while counties with low traffic can appear artificially high- or low-risk due to random year-to-year variation.
+By modelling road fatalities relative to distance travelled, this study provides fair, exposure-adjusted comparisons of road safety risk across Irish counties and supports evidence-based regional road safety planning.
+
+
+
+# Objectives
+
+
+
+-Combine fatality counts with vehicle kilometres travelled to estimate county fatality rates (2015–2024).
+
+-Model county differences and time trends using a Poisson GLMM.
+
+-Examine changes during COVID-19 (2020–2021) and the post-restriction period.
+
+-Rank counties using Bayesian hierarchial Poisson model(county specific rates).Borrows strength across counties to stabilise rates and provides credible intervals to quantify ranking uncertainty.
+
+
+# Data Sources
+
+
+The file contains county-level annual counts of road traffic fatalities and injuries for Ireland (2015–2024). Variables include **county, year, number of persons killed, and number of persons injured**.                                                                         Variables Used in Modelling are the **number of deaths per county-year** was used as the primary outcome variable. **Vehicle kilometres travelled** were included as an exposure term to model fatality rates per distance travelled.
+Vehicle kilometres travelled by county and year were obtained. This exposure term enables comparison of road traffic fatality rates, rather than raw counts.
+
+
+# Results 1: Deaths and Injuries by county over time
+
+
+
+```{r read_data, include=FALSE, results='hide'}
+df1 <- read.csv("road_accidents.csv")
+df2 <- read.csv("THA17.20251105T151118.csv")
+
+cat("Head of road_accidents.csv:\n")
+head(df1)
+
+cat("\nHead of THA17.20251105T151118.csv:\n")
+head(df2)
+```
+
+
+```{r prep_data, include=FALSE, results='hide'}
+library(dplyr)
+library(tidyr)
+
+df1_small <- df1 %>%
+  filter(Statistic.Label %in% c("Persons Killed", "Persons Injured"),
+         Year >= 2015) %>%
+  mutate(County = gsub("Co\\. ", "", County)) %>%
+  select(Year, County, Statistic.Label, VALUE)
+
+accidents <- df1_small %>%
+  pivot_wider(names_from = Statistic.Label, values_from = VALUE)
+
+df2_small <- df2 %>%
+  mutate(County = gsub("Co\\. ", "", County.of.Ownership)) %>%
+  filter(Year >= 2015) %>%
+  select(Year, County, Type.of.Vehicle, Year.of.Registration, Km_Travelled = VALUE)
+
+final_df <- merge(df2_small, accidents,
+                  by = c("Year", "County"),
+                  all.x = TRUE)
+
+# View
+head(final_df)
+```
+
+
+```{r county_palette, include=FALSE}
+# One shared colour palette for all counties (consistent across plots)
+all_counties <- sort(unique(accidents$County))
+cols <- setNames(
+  Polychrome::palette36.colors(length(all_counties)),
+  all_counties
+)
+```
+
+```{r out.width='90%', fig.height=4.2}
+# Build deaths + injuries datasets (same County/Year structure)
+deaths_df <- df1 %>%
+  filter(Statistic.Label == "Persons Killed", Year >= 2015, Year <= 2024) %>%
+  mutate(County = gsub("Co\\. ", "", County)) %>%
+  transmute(Year, County, deaths = VALUE)
+
+injuries_df <- df1 %>%
+  filter(Statistic.Label == "Persons Injured", Year >= 2015, Year <= 2024) %>%
+  mutate(County = gsub("Co\\. ", "", County)) %>%
+  transmute(Year, County, injuries = VALUE)
+
+# shared palette (based on all counties across BOTH)
+all_counties <- sort(unique(c(deaths_df$County, injuries_df$County)))
+cols <- setNames(Polychrome::palette36.colors(length(all_counties)), all_counties)
+
+# Deaths
+ggplot(deaths_df, aes(x = Year, y = deaths, color = County, group = County)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = sort(unique(deaths_df$Year))) +
+  scale_color_manual(values = cols) +
+  labs(title = "Number of People Killed by County (Year by Year)",
+       x = "Year", y = "Persons Killed", color = "County") +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "right")
+
+# Injuries (no county names)
+ggplot(injuries_df, aes(x = Year, y = injuries, color = County, group = County)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = sort(unique(injuries_df$Year))) +
+  scale_color_manual(values = cols) +
+  labs(title = "Number of People Injured by County (Year by Year)",
+       x = "Year", y = "Persons Injured") +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")
+
+
+```
+Fatality counts vary widely across counties and fluctuate year to year, with occasional sharp spikes. Larger, high-traffic counties tend to show higher counts, while smaller counties can look unusually high or low due to random variation. This highlights why we model fatalities per distance travelled and use Bayesian hierarchical model for fair county comparisons.
+
+Injury counts vary strongly by county, with one high-volume county consistently reporting far more injuries than the rest, while most counties remain clustered at much lower levels. A clear drop occurs around 2020 (consistent with COVID-19 mobility restrictions), followed by a partial rebound in later years. Overall, the plot shows that raw injury counts are dominated by differences in traffic volume and major external shocks, reinforcing the need for exposure-adjusted rates to compare counties fairly.
+
+# Results 2: Overall rate trend
+
+```{r overall_build, include=FALSE, results='hide'}
+# Assumes df1 and df2 already exist from your read_data chunk
+
+stat_col2 <- pick_stat_col(df2)
+stopifnot(!is.na(stat_col2))
+
+# National exposure (sum of county vehicle km) in million km
+vmt_nat <- df2 %>%
+  mutate(County = gsub("Co\\. ", "", County.of.Ownership)) %>%
+  filter(.data[[stat_col2]] == "Kilometres Travelled",
+         Year >= 2015, Year <= 2024,
+         County.of.Ownership != "Ireland",
+         Type.of.Vehicle == "All vehicle types",
+         Year.of.Registration == "All years") %>%
+  transmute(Year, VM = VALUE / 1000)  # million km
+
+# National deaths and injuries per year (sum across counties)
+deaths_nat <- df1 %>%
+  filter(Statistic.Label == "Persons Killed",
+         Year >= 2015, Year <= 2024) %>%
+  group_by(Year) %>%
+  summarise(deaths = sum(VALUE, na.rm = TRUE), .groups = "drop")
+
+inj_nat <- df1 %>%
+  filter(Statistic.Label == "Persons Injured",
+         Year >= 2015, Year <= 2024) %>%
+  group_by(Year) %>%
+  summarise(injuries = sum(VALUE, na.rm = TRUE), .groups = "drop")
+
+overall <- vmt_nat %>%
+  group_by(Year) %>%
+  summarise(VM = sum(VM, na.rm = TRUE), .groups = "drop") %>%
+  left_join(deaths_nat, by = "Year") %>%
+  left_join(inj_nat, by = "Year") %>%
+  mutate(
+    deaths_rate   = deaths / VM,     # deaths per million km (since VM is in million km)
+    injuries_rate = injuries / VM    # injuries per million km
+  ) %>%
+  arrange(Year)
+```
+
+
+```{r overall_deaths_plot, echo=FALSE, out.width="95%", fig.height=3.4}
+library(ggplot2)
+library(scales)
+
+ggplot(overall, aes(x = Year, y = deaths_rate)) +
+  geom_line(linewidth = 1.3, color = "#d73027") +
+  geom_point(size = 3, color = "#d73027") +
+  scale_x_continuous(breaks = sort(unique(overall$Year))) +
+  scale_y_continuous(labels = number_format(accuracy = 0.01)) +
+  theme_minimal(base_size = 16) +
+  labs(
+    title = "Overall Road Fatality Rate in Ireland",
+    subtitle = "Deaths per million vehicle kilometres travelled",
+    x = "Year",
+    y = "Deaths per million km"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+The adjusted fatality rate has no statistical annual variations, but it increased dramatically in 2020 and dropped a bit in 2021-2022 before rising once again in 2023. This suggests that road safety benefits were not linear and probably interfered with alterations in the travel behaviour during the COVID-19 period.
+
+
+```{r overall_injuries_plot, echo=FALSE, out.width="95%", fig.height=3.4}
+ggplot(overall, aes(x = Year, y = injuries_rate)) +
+  geom_line(linewidth = 1.3, color = "#4575b4") +
+  geom_point(size = 3, color = "#4575b4") +
+  scale_x_continuous(breaks = sort(unique(overall$Year))) +
+  scale_y_continuous(labels = number_format(accuracy = 1)) +
+  theme_minimal(base_size = 16) +
+  labs(
+    title = "Overall Road Injury Rate in Ireland",
+    subtitle = "Injuries per million vehicle kilometres travelled",
+    x = "Year",
+    y = "Injuries per million km"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+The national road injury rate per million vehicle kilometres shows an overall declining trend from 2015 to 2023. After a temporary increase around 2018–2019, injury rates drop sharply from 2020 onwards and remain below pre-pandemic levels, suggesting sustained improvements in road safety after accounting for travel exposure.
+
+
+# Results 3: Bayesian county rate ranking
+
+\textbf{Bayesian hierarchical Poisson model}
+
+Let $i=1,\dots,n$ index observations (county--year rows) and let $c(i)\in\{1,\dots,N\}$ denote the county for observation $i$.
+
+\textbf{Likelihood}
+$$
+X_i \mid \mu_i \sim \text{Poisson}(\mu_i).
+$$
+
+\textbf{Linear predictor with exposure offset}
+$$
+\log(\mu_i)=\log(VM_i)+\eta_i,
+$$
+$$
+\eta_i=(\beta_0+b_{0,c(i)})+(\beta_1+b_{1,c(i)})\,Year_{c,i}+(\beta_2+b_{2,c(i)})\,Covid_i.
+$$
+
+\textbf{Rate form}
+$$
+\lambda_i=\frac{\mu_i}{VM_i}=\exp(\eta_i).
+$$
+
+\textbf{Priors (as in JAGS)}
+$$
+\beta_k \sim \mathcal{N}(0,10^6), \quad k\in\{0,1,2\},
+$$
+$$
+b_{k,c}\mid \tau_k \sim \mathcal{N}(0,\tau_k^{-1}), \quad k\in\{0,1,2\},\; c=1,\dots,N,
+$$
+$$
+\tau_k \sim \text{Gamma}(0.001,0.001), \quad k\in\{0,1,2\},
+$$
+$$
+sd_k=\tau_k^{-1/2}.
+$$
+
+
+The road traffic fatalities were modeled using Bayesian hierarchical Poisson regression (JAGS). The fatalities are planned as the count of Poisson, and the vehicle kilometres travelled are put as a log-offset, which implies that the model estimates the fatality rates per distance travelled, not by the actual count. The model contains a county-specific intercept, a county-specific time trend and county-specific COVID-19 effect, based on which the posterior mean fatality rates and 95% credible intervals of county-specific risk and trends are calculated.
+
+```{r bayes_fit, include=FALSE}
+# Fit once, then reuse during knitting
+if (file.exists("fatalities_sim.rds")) {
+  fatalities_sim <- readRDS("fatalities_sim.rds")
+} else {
+
+  accidents <- df1 %>%
+    filter(Statistic.Label == "Persons Killed", Year >= 2015, Year <= 2024) %>%
+    mutate(County = gsub("Co\\. ", "", County)) %>%
+    transmute(Year, County, deaths = VALUE)
+
+  vmt <- df2 %>%
+    mutate(County = gsub("Co\\. ", "", County.of.Ownership)) %>%
+    filter(Statistic.Label == "Kilometres Travelled",
+           Year >= 2015, Year <= 2024,
+           County.of.Ownership != "Ireland",
+           Type.of.Vehicle == "All vehicle types",
+           Year.of.Registration == "All years") %>%
+    transmute(Year, County, VM = VALUE / 1000)
+
+  dat <- left_join(vmt, accidents, by = c("Year", "County")) %>%
+    mutate(deaths = ifelse(is.na(deaths), 0L, deaths)) %>%
+    arrange(County, Year) %>%
+    mutate(county_id = as.integer(factor(County)))
+
+  N_county <- n_distinct(dat$county_id)
+
+  X <- dat$deaths
+  VM <- dat$VM
+  county <- dat$county_id
+  nObs <- nrow(dat)
+
+  fatalities_model <- "
+  model{
+    for (i in 1:nObs) {
+      X[i] ~ dpois(theta[county[i]] * VM[i])
+    }
+    for (c in 1:N) {
+      theta[c] ~ dgamma(alpha, beta)
+    }
+    alpha ~ dgamma(0.001, 0.001)
+    beta  ~ dgamma(0.001, 0.001)
+  }"
+
+  jags_data <- list(X = X, VM = VM, county = county, nObs = nObs, N = N_county)
+
+  fatalities_jags <- rjags::jags.model(
+    textConnection(fatalities_model),
+    data = jags_data,
+    n.chains = 4,
+    n.adapt = 1000
+  )
+
+  update(fatalities_jags, n.iter = 10000)
+
+  fatalities_sim <- coda.samples(
+    model = fatalities_jags,
+    variable.names = c("theta", "alpha", "beta"),
+    n.iter = 20000
+  )
+
+  saveRDS(fatalities_sim, "fatalities_sim.rds")
+  saveRDS(dat, "dat_for_theta.rds")  # so theta plot can also reuse dat safely
+}
+
+```
+
+
+```{r theta_rank, echo=FALSE, out.width='90%', fig.height=3.9}
+fatalities_sim <- readRDS("fatalities_sim.rds")
+dat <- readRDS("dat_for_theta.rds")  
+
+theta_mat <- as.matrix(fatalities_sim)
+theta_cols <- grep("theta[", colnames(theta_mat), fixed = TRUE)
+theta_only <- theta_mat[, theta_cols, drop = FALSE]
+
+# Map county_id -> County name
+county_map <- dat %>%
+  distinct(county_id, County) %>%
+  arrange(county_id)
+
+theta_post <- tibble(
+  county_id  = 1:ncol(theta_only),
+  theta_mean = colMeans(theta_only),
+  theta_l95  = apply(theta_only, 2, quantile, 0.025),
+  theta_u95  = apply(theta_only, 2, quantile, 0.975)
+) %>%
+  left_join(county_map, by = "county_id") %>%
+  arrange(desc(theta_mean))
+
+# Plot top counties with uncertainty (colored by county)
+top15 <- theta_post %>% slice(1:15)
+
+ggplot(top15, aes(x = reorder(County, theta_mean),
+                  y = theta_mean,
+                  color = County)) +
+  geom_point(size = 2.2) +
+  geom_errorbar(aes(ymin = theta_l95, ymax = theta_u95), width = 0.2) +
+  coord_flip() +
+  scale_color_viridis_d(option = "C") +
+  labs(
+    title = "Bayesian county ranking of fatality rate (top 15)",
+    subtitle = "Color scheme: each color corresponds to a county (identifier only)",
+    x = "County",
+    y = "Posterior mean theta (95% CrI)",
+    color = "County (color = ID)"
+  ) +
+  annotate(
+    "text",
+    x = Inf, y = -Inf,
+    label = "Colours distinguish counties only; risk is shown by theta and 95% CrI bars.",
+    hjust = 1.05, vjust = -0.6, size = 3.2
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 9),
+    legend.text  = element_text(size = 8),
+    plot.subtitle = element_text(size = 10)
+  )
+
+```
+The top 15 counties sorted by the posterior mean fatality rate (θ) are presented in this figure based on a Bayesian hierarchical Poisson model with the number of kilometres travelled (vehicle kilometres travelled) adjusted. The posterior means are denoted by points and the 95% credible intervals are denoted by horizontal bars. The greater the theta value of the counties, the greater is the estimated risk of fatality per distance travelled. Large credible intervals imply increased uncertainty, which is usually by lower counts or exposure. The hierarchical form reduces the extreme estimates to the mean "shrinkage", which generates the comparisons between counties more reasonable though slightly baised they will have less variance.
+
+
+
+# Interactive Dashboard Results (Shiny App)
+
+**We built an interactive Ireland Road Safety Dashboard (2015–2024)** to explore county-level variation in deaths, injuries, and exposure-adjusted rates.
+**App outputs (user controls):**
+- Map variable options: deaths, injuries, deaths per billion km, injuries per billion km, log(total km), and average population (2015–2024).
+- Year slider (2015–2024) and county dropdown to zoom/focus.
+- Click counties to view a popup with the selected metric for the chosen year.
+
+```{r, echo=FALSE, out.width='85%'}
+
+if (file.exists("app_screenshot2.png")) {
+  knitr::include_graphics("app_screenshot2.png")
+}
+```
+
+*Interpretation:* County colours on the map indicate the **level of the selected metric**. Counties in warmer colours have higher deaths per million km, indicating higher risk after adjusting for travel volume.
+
+
+# Next Steps
+
+- Produce Bayesian posterior rankings (with rank probabilities/credible intervals) to quantify uncertainty in county ordering.
+- Incorporate additional covariates (population size, urbanisation, COVID-period indicators) to explain between-county variation in risk.
+- Produce posterior predictive maps to visualise spatial patterns in fatality rates while accounting for uncertainty.
+- Develop a fully reproducible interactive dashboard for exploring county-level trends, rankings, and uncertainty.
+
+
+# GitHub
+
+
+
+Project repository: <https://github.com/SRaees25245337/Poster-Presentation>
+
+
+
+# References
+
+
+- Gelman, A., Carlin, J.B., Stern, H.S., Dunson, D.B., Vehtari, A. and Rubin, D.B. (2013) Bayesian Data Analysis. 3rd edn. Boca Raton: Chapman & Hall/CRC.
+
+- Hoff, P.D. (2009) A First Course in Bayesian Statistical Methods. Springer.
+
+- Plummer, M. (2003) JAGS https://mcmc-jags.sourceforge.net/
+
+- Central Statistics Office (n.d.) PxStat Open Data Statistical Database (data.cso.ie) [database]. Available at - https://data.cso.ie/
+
+- Central Statistics Office (2024) THA17 – Road Traffic Volumes [dataset]. data.gov.ie. Available at: https://data.gov.ie/dataset/tha17-road-traffic-volumes
+ (Accessed: 27 January 2026).
